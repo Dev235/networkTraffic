@@ -1,8 +1,8 @@
-import tkinter as tk
 from tkinter import ttk
+import tkinter as tk
 import threading
 import psutil
-from scapy.all import sniff
+from scapy.all import sniff, IP, IPv6
 import sv_ttk
 import time
 from queue import Queue, Empty
@@ -103,6 +103,8 @@ class MonitorPage(tk.Frame):
     def sniff_packets(self):
         def process(pkt):
             if not self.stop_sniffing.is_set():
+                if pkt.haslayer("IPv6"):
+                    return  # Skip IPv6 packets like avoiding your ex
                 self.packet_queue.put(pkt)
 
         try:
@@ -116,9 +118,17 @@ class MonitorPage(tk.Frame):
                 pkt = self.packet_queue.get_nowait()
                 self.packet_count += 1
 
-                src = pkt[0].src if hasattr(pkt[0], "src") else "N/A"
-                dst = pkt[0].dst if hasattr(pkt[0], "dst") else "N/A"
-                proto = pkt[0].name if hasattr(pkt[0], "name") else pkt.name
+                src = dst = proto = "N/A"
+
+                if pkt.haslayer("IP"):
+                    src = pkt["IP"].src
+                    dst = pkt["IP"].dst
+                    proto = pkt["IP"].proto if hasattr(pkt["IP"], "proto") else "IPv4"
+                elif hasattr(pkt, "src") and hasattr(pkt, "dst"):
+                    src = pkt.src
+                    dst = pkt.dst
+                    proto = pkt.name
+
                 length = len(pkt)
 
                 if len(self.packets) >= 500:
@@ -136,6 +146,9 @@ class MonitorPage(tk.Frame):
             print("Error inserting packet:", e)
         finally:
             self.after(100, self.insert_packet)
+
+
+
 
     def stop_capturing(self):
         self.stop_sniffing.set()
