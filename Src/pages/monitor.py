@@ -1,8 +1,8 @@
-from tkinter import ttk
 import tkinter as tk
+from tkinter import ttk
 import threading
 import psutil
-from scapy.all import sniff, IP, IPv6
+from scapy.all import sniff
 import sv_ttk
 import time
 from queue import Queue, Empty
@@ -34,10 +34,13 @@ class MonitorPage(tk.Frame):
         self.packet_frame = ttk.Frame(self)
         self.packet_frame.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=10, pady=5)
 
-        self.packet_tree = ttk.Treeview(self.packet_frame, columns=("No", "Src", "Dst", "Proto", "Length"), show='headings', height=10)
-        for col in ("No", "Src", "Dst", "Proto", "Length"):
+        self.packet_tree = ttk.Treeview(self.packet_frame, columns=(
+            "No", "Time", "Src", "Dst", "Proto", "Length", "Info", "Summary"
+        ), show='headings', height=10)
+
+        for col in ("No", "Time", "Src", "Dst", "Proto", "Length", "Info", "Summary"):
             self.packet_tree.heading(col, text=col)
-            self.packet_tree.column(col, width=100, anchor="center")
+            self.packet_tree.column(col, width=120, anchor="center")
         self.packet_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.v_scroll = ttk.Scrollbar(self.packet_frame, orient="vertical", command=self.packet_tree.yview)
@@ -103,8 +106,6 @@ class MonitorPage(tk.Frame):
     def sniff_packets(self):
         def process(pkt):
             if not self.stop_sniffing.is_set():
-                if pkt.haslayer("IPv6"):
-                    return  # Skip IPv6 packets like avoiding your ex
                 self.packet_queue.put(pkt)
 
         try:
@@ -118,18 +119,13 @@ class MonitorPage(tk.Frame):
                 pkt = self.packet_queue.get_nowait()
                 self.packet_count += 1
 
-                src = dst = proto = "N/A"
-
-                if pkt.haslayer("IP"):
-                    src = pkt["IP"].src
-                    dst = pkt["IP"].dst
-                    proto = pkt["IP"].proto if hasattr(pkt["IP"], "proto") else "IPv4"
-                elif hasattr(pkt, "src") and hasattr(pkt, "dst"):
-                    src = pkt.src
-                    dst = pkt.dst
-                    proto = pkt.name
-
+                timestamp = time.strftime("%H:%M:%S", time.localtime(pkt.time))
+                src = pkt[0].src if hasattr(pkt[0], "src") else "N/A"
+                dst = pkt[0].dst if hasattr(pkt[0], "dst") else "N/A"
+                proto = pkt[0].name.upper() if hasattr(pkt[0], "name") else pkt.name.upper()
                 length = len(pkt)
+                info = pkt.summary()
+                summary = pkt.sprintf("%IP.src% → %IP.dst%" if pkt.haslayer("IP") else "%src% → %dst%")
 
                 if len(self.packets) >= 500:
                     self.packets.pop(0)
@@ -139,16 +135,13 @@ class MonitorPage(tk.Frame):
                 if len(self.packet_tree.get_children()) >= 200:
                     self.packet_tree.delete(self.packet_tree.get_children()[0])
 
-                self.packet_tree.insert("", "end", values=(self.packet_count, src, dst, proto, length))
+                self.packet_tree.insert("", "end", values=(self.packet_count, timestamp, src, dst, proto, length, info, summary))
         except Empty:
             pass
         except Exception as e:
             print("Error inserting packet:", e)
         finally:
             self.after(100, self.insert_packet)
-
-
-
 
     def stop_capturing(self):
         self.stop_sniffing.set()
