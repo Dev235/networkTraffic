@@ -57,7 +57,7 @@ class MonitorPage(tk.Frame):
         packet_frame.grid_rowconfigure(0, weight=1)
         packet_frame.grid_columnconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(packet_frame, columns=("No", "Time", "SrcIP", "SrcPort", "DstIP", "DstPort", "Proto", "Length"), show="headings")
+        self.tree = ttk.Treeview(packet_frame, columns=("No", "Time", "Source IP", "Source Port", "Destination IP", "Destination Port", "Protocol", "Length"), show="headings")
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.setup_treeview(self.tree)
         self.tree.bind('<<TreeviewSelect>>', self.on_packet_select)
@@ -99,7 +99,7 @@ class MonitorPage(tk.Frame):
         anomaly_frame.grid_rowconfigure(0, weight=1)
         anomaly_frame.grid_columnconfigure(0, weight=1)
 
-        self.anomaly_tree = ttk.Treeview(anomaly_frame, columns=("No", "Time", "SrcIP", "SrcPort", "DstIP", "DstPort", "Proto", "Length"), show="headings")
+        self.anomaly_tree = ttk.Treeview(anomaly_frame, columns=("No", "Time", "Source IP", "Source Port", "Destination IP", "Destination Port", "Protocol", "Length"), show="headings")
         self.anomaly_tree.grid(row=0, column=0, sticky="nsew")
         self.setup_treeview(self.anomaly_tree)
         
@@ -127,25 +127,25 @@ class MonitorPage(tk.Frame):
 
     def setup_treeview(self, tree):
         """Helper function to set up the columns for a treeview."""
-        columns = ("No", "Time", "SrcIP", "SrcPort", "DstIP", "DstPort", "Proto", "Length")
+        columns = ("No", "Time", "Source IP", "Source Port", "Destination IP", "Destination Port", "Protocol", "Length")
         tree["columns"] = columns
         
         tree.heading("No", text="No.")
         tree.heading("Time", text="Time")
-        tree.heading("SrcIP", text="Source IP")
-        tree.heading("SrcPort", text="Src Port")
-        tree.heading("DstIP", text="Dest IP")
-        tree.heading("DstPort", text="Dest Port")
-        tree.heading("Proto", text="Protocol")
+        tree.heading("Source IP", text="Source IP")
+        tree.heading("Source Port", text="Source Port")
+        tree.heading("Destination IP", text="Destination IP")
+        tree.heading("Destination Port", text="Destination Port")
+        tree.heading("Protocol", text="Protocol")
         tree.heading("Length", text="Length")
 
         tree.column("No", width=50, anchor='center')
         tree.column("Time", width=150, anchor='center')
-        tree.column("SrcIP", width=120, anchor='w')
-        tree.column("SrcPort", width=80, anchor='center')
-        tree.column("DstIP", width=120, anchor='w')
-        tree.column("DstPort", width=80, anchor='center')
-        tree.column("Proto", width=80, anchor='center')
+        tree.column("Source IP", width=120, anchor='w')
+        tree.column("Source Port", width=100, anchor='center')
+        tree.column("Destination IP", width=120, anchor='w')
+        tree.column("Destination Port", width=100, anchor='center')
+        tree.column("Protocol", width=80, anchor='center')
         tree.column("Length", width=80, anchor='center')
 
     def set_interface(self, interface_name):
@@ -195,43 +195,50 @@ class MonitorPage(tk.Frame):
         self.packet_count += 1
         self.all_packets_scapy.append(packet)
         
-        timestamp = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(packet.time))}.{int(packet.time * 1000000) % 1000000}"
+        unix_timestamp = int(packet.time)
+        display_timestamp = time.strftime('%H:%M:%S', time.localtime(unix_timestamp))
         
         ip_layer = packet[IP]
         src_ip = ip_layer.src
         dst_ip = ip_layer.dst
         
-        src_port, dst_port, proto_name = "-", "-", "IP"
+        protocol_num = ip_layer.proto
+        
+        src_port, dst_port, protocol_name = "-", "-", str(protocol_num)
 
-        if TCP in packet:
-            proto_name = "TCP"
+        if protocol_num == 6 and TCP in packet:
+            protocol_name = "TCP"
             src_port = packet[TCP].sport
             dst_port = packet[TCP].dport
-        elif UDP in packet:
-            proto_name = "UDP"
+        elif protocol_num == 17 and UDP in packet:
+            protocol_name = "UDP"
             src_port = packet[UDP].sport
             dst_port = packet[UDP].dport
-        elif ICMP in packet:
-            proto_name = "ICMP"
+        elif protocol_num == 1 and ICMP in packet:
+            protocol_name = "ICMP"
 
-        values = (self.packet_count, timestamp, src_ip, src_port, dst_ip, dst_port, proto_name, len(packet))
-        self.all_packets_data.append(values)
+        # Store data for export with the numerical protocol
+        export_values = (unix_timestamp, src_ip, src_port, dst_ip, dst_port, protocol_num, len(packet))
+        self.all_packets_data.append(export_values)
         
+        # Use human-readable protocol name for display in the GUI
+        display_values = (self.packet_count, display_timestamp, src_ip, src_port, dst_ip, dst_port, protocol_name, len(packet))
+
         try:
             tree_id = str(self.packet_count)
-            self.tree.insert("", "end", iid=tree_id, values=values)
+            self.tree.insert("", "end", iid=tree_id, values=display_values)
             self.tree.yview_moveto(1.0)
             
             if self.is_anomalous(packet):
                 self.anomaly_count += 1
-                anomaly_values = (self.anomaly_count,) + values[1:]
-                self.anomaly_tree.insert("", "end", values=anomaly_values)
+                anomaly_display_values = (self.anomaly_count,) + display_values[1:]
+                self.anomaly_tree.insert("", "end", values=anomaly_display_values)
                 self.anomaly_tree.yview_moveto(1.0)
         except tk.TclError:
             pass
 
     def is_anomalous(self, packet):
-        # Placeholder for your anomaly detection logic
+        # Placeholder logic for anomaly detection
         if TCP in packet and (packet[TCP].dport == 8080 or packet[TCP].sport == 8080):
             return True
         return False
@@ -239,14 +246,17 @@ class MonitorPage(tk.Frame):
     def on_packet_select(self, event):
         selected_item_id = self.tree.focus()
         if selected_item_id:
-            item_index = int(selected_item_id) - 1
-            if 0 <= item_index < len(self.all_packets_scapy):
-                packet = self.all_packets_scapy[item_index]
-                header_info = packet.show(dump=True)
-                self.header_text.config(state='normal')
-                self.header_text.delete(1.0, tk.END)
-                self.header_text.insert(tk.END, header_info)
-                self.header_text.config(state='disabled')
+            try:
+                item_index = int(selected_item_id) - 1
+                if 0 <= item_index < len(self.all_packets_scapy):
+                    packet = self.all_packets_scapy[item_index]
+                    header_info = packet.show(dump=True)
+                    self.header_text.config(state='normal')
+                    self.header_text.delete(1.0, tk.END)
+                    self.header_text.insert(tk.END, header_info)
+                    self.header_text.config(state='disabled')
+            except ValueError:
+                pass
 
     def update_system_info(self):
         if self.winfo_exists():
@@ -256,7 +266,7 @@ class MonitorPage(tk.Frame):
             self.after(1000, self.update_system_info)
 
     def export_data(self):
-        """Exports the captured packet data to a CSV file."""
+        """Exports captured data to a CSV file without the 'No.' column."""
         if not self.all_packets_data:
             messagebox.showinfo("No Data", "There is no data to export.")
             return
@@ -273,9 +283,9 @@ class MonitorPage(tk.Frame):
         try:
             with open(file_path, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
-                # Write header
-                writer.writerow(["No", "Time", "SrcIP", "SrcPort", "DstIP", "DstPort", "Proto", "Length"])
-                # Write packet data
+                # Write header without 'No.'
+                writer.writerow(["Timestamp", "Source IP", "Source Port", "Destination IP", "Destination Port", "Protocol", "Length"])
+                # Write data rows
                 writer.writerows(self.all_packets_data)
             messagebox.showinfo("Export Successful", f"Data successfully exported to:\n{file_path}")
         except Exception as e:
