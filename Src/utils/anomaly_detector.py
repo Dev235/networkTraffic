@@ -4,6 +4,7 @@ import joblib
 import pandas as pd
 import os
 import numpy as np
+# from sklearn.ensemble import RandomForestClassifier # Not needed here, only for type hinting if desired
 
 class AnomalyDetector:
     """
@@ -51,43 +52,73 @@ class AnomalyDetector:
         Returns:
             pd.Series: A Series of predictions (e.g., 'Normal Traffic' or 'Attack_Type').
             pd.Series: A Series of anomaly probabilities/scores.
+            pd.Series: A boolean Series indicating if a flow is anomalous.
         """
         if self.model is None or self.scaler is None:
             print("Anomaly detector is not initialized (model/scaler missing). Cannot detect.")
-            return pd.Series(), pd.Series() # Return empty series
+            return pd.Series(), pd.Series(), pd.Series()
 
         if flow_features_df.empty:
-            return pd.Series(), pd.Series()
+            return pd.Series(), pd.Series(), pd.Series()
 
-        # Scale the features
         try:
-            scaled_features = self.scaler.transform(flow_features_df)
+            # --- DEBUGGING: Print features received by detector ---
+            print("AnomalyDetector: Features received for detection:")
+            print(flow_features_df.columns.tolist())
+            print(f"Shape of received features: {flow_features_df.shape}\n")
+            # --- END DEBUGGING ---
+
+            # Scale the features. This outputs a NumPy array.
+            scaled_features = pd.DataFrame(
+                self.scaler.transform(flow_features_df),
+                columns=flow_features_df.columns
+            )
+
             
-            # Predict using the model
+            # Predict labels
             predictions = self.model.predict(scaled_features)
             
-            # For Random Forest, you can get probabilities of each class
+            # Get probabilities for each class
             probabilities = self.model.predict_proba(scaled_features)
             
-            # Assuming 'Normal Traffic' is one of the classes, and others are anomalies
-            # We need to map numerical predictions back to original labels if the model outputs numbers
-            # Get class names from the model if available
-            class_names = self.model.classes_ # e.g., ['Normal Traffic', 'DoS', 'DDoS', ...]
+            # Ensure model.classes_ is a numpy array for consistent indexing
+            class_labels = np.array(self.model.classes_)
             
+            # --- DEBUGGING: Print model classes and probabilities shape ---
+            print(f"Model classes: {class_labels}")
+            print(f"Probabilities shape: {probabilities.shape}\n")
+            # --- END DEBUGGING ---
+
+            anomaly_scores = pd.Series(np.zeros(len(predictions)), index=flow_features_df.index)
+            
+            # --- MODIFIED: More robust way to get attack class indices ---
+            attack_class_indices = [i for i, label in enumerate(class_labels) if label != 'Normal Traffic']
+            
+            if len(attack_class_indices) > 0:
+                # Select probabilities corresponding to attack classes using integer indices
+                # Ensure probabilities is a pure numpy array just before slicing, although it should be already
+                probabilities_np = np.asarray(probabilities) 
+                attack_probabilities = probabilities_np[:, attack_class_indices]
+                
+                # The anomaly score is the maximum probability among these attack classes
+                anomaly_scores = pd.Series(np.max(attack_probabilities, axis=1), index=flow_features_df.index)
+            else:
+                anomaly_scores = pd.Series(np.zeros(len(predictions)), index=flow_features_df.index)
+
             # Convert numerical predictions back to class names
-            predicted_labels = pd.Series([class_names[pred_idx] for pred_idx in predictions], index=flow_features_df.index)
+            predicted_labels = pd.Series([class_labels[int(pred_idx)] if isinstance(pred_idx, (int, np.integer)) else pred_idx for pred_idx in predictions],index=flow_features_df.index)
+
             
-            # Determine if it's an anomaly: if it's not 'Normal Traffic'
+            # A flow is anomalous if its predicted label is NOT 'Normal Traffic'
             is_anomaly = (predicted_labels != 'Normal Traffic')
-            
-            # For anomaly score, we might use the probability of 'Normal Traffic' being low,
-            # or simply mark as 'anomaly' (1) if it's not normal.
-            # A simple anomaly score could be 1 for anomaly, 0 for normal.
-            # Or, for multi-class, we could sum probabilities of attack classes.
-            anomaly_scores = pd.Series(np.max(probabilities[:, self.model.classes_ != 'Normal Traffic'], axis=1) if 'Normal Traffic' in self.model.classes_ else np.max(probabilities, axis=1), index=flow_features_df.index)
             
             return predicted_labels, anomaly_scores, is_anomaly
 
+
         except Exception as e:
             print(f"Error during anomaly detection: {e}")
-            return pd.Series(), pd.Series(), pd.Series() # Return empty series
+            # You can add more detailed debugging here if needed, e.g., print types and shapes
+            # print(f"Debug: type(probabilities)={type(probabilities)}, probabilities.shape={probabilities.shape if hasattr(probabilities, 'shape') else 'N/A'}")
+            # print(f"Debug: type(class_labels)={type(class_labels)}, class_labels.shape={class_labels.shape if hasattr(class_labels, 'shape') else 'N/A'}")
+            # print(f"Debug: attack_class_indices={attack_class_indices}, type(attack_class_indices)={type(attack_class_indices)}")
+            return pd.Series(), pd.Series(), pd.Series()

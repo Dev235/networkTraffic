@@ -61,6 +61,12 @@ def train_and_save_model():
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=RANDOM_STATE, stratify=y)
     
+    # --- ADDED FOR DEBUGGING: Print the exact column names used for training ---
+    print("\n--- Features used for model training (X_train.columns.tolist()): ---")
+    print(X_train.columns.tolist())
+    print("-------------------------------------------------------------------\n")
+    # --- END DEBUGGING CODE ---
+
     # Clean up original df to save memory
     del X, y, clean_df
 

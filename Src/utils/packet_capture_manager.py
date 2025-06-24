@@ -2,13 +2,14 @@
 
 import threading
 import time
-from scapy.all import sniff, IP, TCP, UDP, ICMP, wrpcap # Import wrpcap for PCAP export
-from .anomaly_detector import AnomalyDetector  # Relative import
-from utils.flow_feature_extractor import FlowFeatureExtractor # Absolute import
+from scapy.all import sniff, IP, TCP, UDP, ICMP, wrpcap
+from utils.anomaly_detector import AnomalyDetector
+from utils.flow_feature_extractor import FlowFeatureExtractor
 import pandas as pd
 import os
 import csv
 import re
+from tkinter import messagebox
 
 class PacketCaptureManager:
     """
@@ -21,7 +22,7 @@ class PacketCaptureManager:
 
         Args:
             update_gui_callback: A function in the GUI to call when a packet is processed.
-                                 It should accept (packet_data_for_display, is_anomalous_flag).
+                                 It should accept (packet_data_for_display, is_anomalous_flag, scapy_packet_idx, flow_details, flow_processed, error_message).
             anomaly_detector: An instance of AnomalyDetector.
         """
         self.selected_interface = None
@@ -33,7 +34,7 @@ class PacketCaptureManager:
         self.anomaly_detector = anomaly_detector
         self.all_captured_scapy_packets = [] # Store raw scapy packets for header display AND PCAP export
         self.flow_extractor = FlowFeatureExtractor() # Initialize the flow feature extractor
-        self.anomalous_flows_data = [] # Store detected anomalous flow features
+        self.anomalous_flows_data = [] # Store detected anomalous flow features (dict includes prediction/score)
 
     def set_interface(self, interface_name):
         """Sets the interface for sniffing."""
@@ -66,7 +67,8 @@ class PacketCaptureManager:
         if self.sniffing:
             self.sniffing = False
             # Process any remaining open flows when stopping
-            remaining_flows = self.flow_extractor.get_completed_flow_features(current_time=time.time())
+            # Ensure any lingering flows are processed by advancing time past timeout
+            remaining_flows = self.flow_extractor.get_completed_flow_features(current_time=time.time() + self.flow_extractor.time_window + 1)
             if not remaining_flows.empty:
                 self._process_detected_flows(remaining_flows)
             return True
@@ -89,9 +91,10 @@ class PacketCaptureManager:
             return
 
         try:
-            sniff(iface=self.selected_interface, filter="ip", prn=self._packet_callback, stop_filter=lambda p: not self.sniffing, store=0) # store=0 to save memory for raw packets
+            sniff(iface=self.selected_interface, filter="ip", prn=self._packet_callback, stop_filter=lambda p: not self.sniffing, store=0)
         except Exception as e:
             print(f"Error during sniffing on {self.selected_interface}: {e}")
+            self.update_gui_callback(None, False, -1, None, False, error_message=f"Sniffing failed: {e}. Check Npcap/WinPcap installation and permissions.")
         finally:
             self.sniffing = False
 
@@ -110,8 +113,8 @@ class PacketCaptureManager:
         timestamp_display = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(packet.time))}.{int(packet.time * 1000000) % 1000000}"
         
         ip_layer = packet.getlayer(IP)
-        src_ip = ip_layer.src
-        dst_ip = ip_layer.dst
+        src_ip = ip_layer.src if ip_layer else "N/A"
+        dst_ip = ip_layer.dst if ip_layer else "N/A"
         
         src_port, dst_port, proto_name = 0, 0, "IP"
 
@@ -129,7 +132,7 @@ class PacketCaptureManager:
         values_for_display = (self.packet_count, timestamp_display, src_ip, src_port, dst_ip, dst_port, proto_name, len(packet))
         
         # Pass raw packet index for later retrieval
-        self.update_gui_callback(values_for_display, False, len(self.all_captured_scapy_packets) - 1, flow_processed=False)
+        self.update_gui_callback(values_for_display, False, len(self.all_captured_scapy_packets) - 1, flow_details=None, flow_processed=False)
 
         # If there are completed flows, pass them to the anomaly detector
         if not completed_flows_df.empty:
@@ -139,35 +142,45 @@ class PacketCaptureManager:
         """Internal helper to pass flows to detector and update GUI for anomalies."""
         predictions, scores, is_anomaly_series = self.anomaly_detector.detect_anomaly(flows_df)
 
-        for idx, row in flows_df.iterrows():
+        if predictions.empty: # If detection failed or returned empty
+            return
+
+        for idx, row_series in flows_df.iterrows(): # Iterate over rows as Series
+            # --- START DEBUGGING BLOCK ---
+            print(f"[Flow {idx}] Label: {predictions.get(idx, 'UNKNOWN')} | Anomaly: {is_anomaly_series.get(idx, False)} | Score: {scores.get(idx, 0):.4f}")
+            # --- END DEBUGGING BLOCK ---
+
             if is_anomaly_series.get(idx, False): # Check if this flow is marked as an anomaly
                 self.anomaly_count += 1
                 
-                # Get the relevant packet metadata from the flow extractor (Destination Port here)
-                # For display, we might take the first/last packet of the flow, or summarize
-                # For simplicity, let's create a summary.
+                # Create a dictionary for the anomalous flow including prediction and score
+                flow_data_for_export = row_series.to_dict() # Convert Series row to dict
+                flow_data_for_export['Predicted_Label'] = predictions.get(idx, 'UNKNOWN')
+                flow_data_for_export['Anomaly_Score'] = scores.get(idx, 0.0)
+                self.anomalous_flows_data.append(flow_data_for_export)
+
+                # Update GUI for anomalous flows
+                # Use the 'Flow Start Time' feature for display, which is in seconds (Unix timestamp)
+                flow_start_time_display = "N/A"
+                if 'Flow Start Time' in flow_data_for_export and flow_data_for_export['Flow Start Time'] is not None:
+                    flow_start_time_display = pd.to_datetime(flow_data_for_export['Flow Start Time'], unit='s').strftime('%Y-%m-%d %H:%M:%S')
+                
                 flow_summary_values = (
                     self.anomaly_count, # Use anomaly_count for anomalous display
-                    f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(row['Flow IAT Min']/1_000_000 if row['Flow IAT Min'] != 0 else time.time()))}", # Using flow start time
-                    row['Destination Port'], # Destination Port
-                    row['Flow Duration'], # Flow Duration
+                    flow_start_time_display,
+                    flow_data_for_export['Destination Port'],
+                    f"{flow_data_for_export['Flow Duration']:.0f}", # Flow Duration (microseconds)
                     predictions.get(idx, 'UNKNOWN'), # Predicted Label
                     f"{scores.get(idx, 0):.4f}" # Anomaly Score
                 )
                 
-                # We need to adapt update_gui_callback to accept these specific anomalous flow details
-                # For now, let's just use a simplified version, assuming update_gui_callback can handle it
-                # Or, create a separate callback for anomalous flows.
                 self.update_gui_callback(
-                    (f"Flow {self.anomaly_count}", flow_summary_values[1], "N/A", "N/A", flow_summary_values[2], "N/A", "Flow", "N/A"),
+                    None, # Not updating main packet table with flow summary
                     is_anomalous=True,
-                    scapy_packet_idx=-1, # No specific packet for this flow summary
+                    scapy_packet_idx=-1, # No specific raw packet associated with this summary
                     flow_details=flow_summary_values,
                     flow_processed=True
                 )
-                
-                # Store the full flow features for CSV export
-                self.anomalous_flows_data.append(row.to_dict())
 
 
     def export_data(self, pcap_filename="captured_packets.pcap", csv_filename="anomalous_flows.csv"):
@@ -176,47 +189,37 @@ class PacketCaptureManager:
         """
         if not self.all_captured_scapy_packets and not self.anomalous_flows_data:
             print("No data to export.")
+            messagebox.showinfo("Export Status", "No data to export.")
             return
 
+        current_dir = os.getcwd()
+        
         # Export to PCAP
         if self.all_captured_scapy_packets:
-            pcap_path = os.path.join(os.getcwd(), pcap_filename) # Current working directory
+            pcap_path = os.path.join(current_dir, pcap_filename)
             try:
                 wrpcap(pcap_path, self.all_captured_scapy_packets)
                 print(f"Captured packets exported to {pcap_path}")
+                self.all_captured_scapy_packets.clear()
             except Exception as e:
                 print(f"Error exporting PCAP: {e}")
+                messagebox.showerror("Export Error", f"An error occurred while exporting PCAP: {e}")
         
         # Export anomalous flows to CSV
         if self.anomalous_flows_data:
-            csv_path = os.path.join(os.getcwd(), csv_filename) # Current working directory
+            csv_path = os.path.join(current_dir, csv_filename)
             try:
-                # Ensure we have column headers from the first flow or a predefined list
-                if self.anomalous_flows_data:
-                    # Use the same order as in FlowFeatureExtractor's CICIDS_FEATURES_ORDER
-                    # plus an added 'Predicted Label' and 'Anomaly Score' for context.
-                    CICIDS_FEATURES_ORDER_EXTENDED = FlowFeatureExtractor.CICIDS_FEATURES_ORDER + ['Predicted Label', 'Anomaly Score']
-                    
-                    with open(csv_path, 'w', newline='') as csvfile:
-                        writer = csv.DictWriter(csvfile, fieldnames=CICIDS_FEATURES_ORDER_EXTENDED)
-                        writer.writeheader()
-                        for flow_data in self.anomalous_flows_data:
-                            # Map prediction and score into the flow_data dict
-                            # These are added by _process_detected_flows, but ensure consistency
-                            # For now, manually add if not directly in flow_data
-                            # The actual prediction is tied to the row index, not the flow_data dict itself
-                            # Need a way to pass the prediction/score along with the flow_data
-                            
-                            # For a simpler export now:
-                            # just export the raw features, and indicate this is for re-training/analysis
-                            # The predicted label/score would typically be added by the _process_detected_flows
-                            # and stored WITH the flow_data in self.anomalous_flows_data
-                            writer.writerow(flow_data) 
-                            
-                    print(f"Anomalous flow features exported to {csv_path}")
+                # The list of fields should be the features used by the model
+                # plus 'Predicted_Label', 'Anomaly_Score', 'Flow Start Time', 'Flow End Time'
+                fieldnames = FlowFeatureExtractor.CICIDS_FEATURES_ORDER + ['Predicted_Label', 'Anomaly_Score', 'Flow Start Time', 'Flow End Time']
                 
-                # Clear the data after export to prevent re-exporting the same data
+                with open(csv_path, 'w', newline='') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(self.anomalous_flows_data)
+                print(f"Anomalous flow features exported to {csv_path}")
                 self.anomalous_flows_data.clear()
-
+                messagebox.showinfo("Export Status", f"Data successfully exported to:\n{pcap_path}\n{csv_path}")
             except Exception as e:
                 print(f"Error exporting CSV: {e}")
+                messagebox.showerror("Export Error", f"An error occurred while exporting CSV: {e}")
