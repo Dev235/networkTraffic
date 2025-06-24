@@ -1,12 +1,15 @@
+# src/pages/monitor.py
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 import time
 import psutil
-import csv
-from scapy.all import sniff, IP, TCP, UDP, ICMP
 import sv_ttk
-import ipaddress  # <-- Import added
+
+# Import the new modular components using absolute imports
+from utils.packet_capture_manager import PacketCaptureManager
+from utils.anomaly_detector import AnomalyDetector
 
 class MonitorPage(tk.Frame):
     """
@@ -24,12 +27,15 @@ class MonitorPage(tk.Frame):
         super().__init__(parent)
         self.controller = controller
         self.selected_interface = None
-        self.sniffing = False
-        self.packet_count = 0
-        self.anomaly_count = 0
-        self.all_packets_data = []
-        self.all_packets_scapy = []
-        self.sniff_thread = None
+        self.packet_count_display = 0 # Counter for display (might differ from manager's internal count if cleared)
+        self.anomaly_count_display = 0 # Counter for display
+
+        # Initialize the anomaly detector and packet capture manager
+        self.anomaly_detector = AnomalyDetector()
+        self.packet_capture_manager = PacketCaptureManager(
+            update_gui_callback=self._update_traffic_display,
+            anomaly_detector=self.anomaly_detector
+        )
 
         # Set the theme and background
         sv_ttk.set_theme("dark")
@@ -115,8 +121,9 @@ class MonitorPage(tk.Frame):
         self.toggle_capture_button = ttk.Button(button_frame, text="Stop Capturing", command=self.toggle_capture, style="Accent.TButton")
         self.toggle_capture_button.pack(side="left", padx=5)
 
-        self.export_button = ttk.Button(button_frame, text="Export", command=self.export_data_for_ml)
-        self.export_button.pack(side="left", padx=5)
+        # The export button is removed as per your request to strip ML part
+        # self.export_button = ttk.Button(button_frame, text="Export", command=self.export_data_for_ml)
+        # self.export_button.pack(side="left", padx=5)
         
         self.exit_button = ttk.Button(button_frame, text="Exit", command=self.exit_page)
         self.exit_button.pack(side="left", padx=5)
@@ -150,175 +157,97 @@ class MonitorPage(tk.Frame):
         tree.column("Length", width=80, anchor='center')
 
     def set_interface(self, interface_name):
-        """Sets the interface and starts a fresh capture session."""
+        """Sets the interface for packet capture and initiates a fresh session."""
         self.selected_interface = interface_name
-        self.start_capture(fresh_start=True)
-
-    def _start_sniffing_thread(self):
-        """Starts a new sniffing thread."""
-        self.sniff_thread = threading.Thread(target=self.sniff_packets, daemon=True)
-        self.sniff_thread.start()
-
-    def start_capture(self, fresh_start=False):
-        """Starts or resumes packet sniffing."""
-        if not self.sniffing:
-            self.sniffing = True
-            self.toggle_capture_button.config(text="Stop Capturing")
-
-            if fresh_start:
-                self.packet_count = 0
-                self.anomaly_count = 0
-                self.all_packets_data.clear()
-                self.all_packets_scapy.clear()
-                self.tree.delete(*self.tree.get_children())
-                self.anomaly_tree.delete(*self.anomaly_tree.get_children())
-            
-            self._start_sniffing_thread()
+        # Clear GUI displays immediately when setting a new interface
+        self.tree.delete(*self.tree.get_children())
+        self.anomaly_tree.delete(*self.anomaly_tree.get_children())
+        self.packet_count_display = 0
+        self.anomaly_count_display = 0
+        self.packet_capture_manager.set_interface(interface_name)
 
     def toggle_capture(self):
-        """Toggles the sniffing state between running and paused."""
-        self.sniffing = not self.sniffing
-        if self.sniffing:
-            self.toggle_capture_button.config(text="Stop Capturing")
-            self._start_sniffing_thread()
-        else:
-            self.toggle_capture_button.config(text="Resume Capturing")
+        """Toggles the packet capturing state (start/stop/resume)."""
+        new_button_text = self.packet_capture_manager.toggle_capture()
+        self.toggle_capture_button.config(text=new_button_text)
+        # When starting a new capture or resuming, clear displays
+        if new_button_text == "Stop Capturing" and self.packet_capture_manager.packet_count == 0:
+            self.tree.delete(*self.tree.get_children())
+            self.anomaly_tree.delete(*self.anomaly_tree.get_children())
+            self.packet_count_display = 0
+            self.anomaly_count_display = 0
 
-    def sniff_packets(self):
-        """Target for the sniffing thread. Captures only IPv4 packets."""
+
+    def _update_traffic_display(self, values_for_display, is_anomalous_flag, scapy_packet_idx):
+        """
+        Callback method to update the Treeviews in the GUI from the packet capture manager.
+        This runs in the main Tkinter thread safely using after().
+        """
+        # Ensure updates are queued safely to the main thread
+        self.after(0, lambda: self._perform_gui_update(values_for_display, is_anomalous_flag, scapy_packet_idx))
+
+    def _perform_gui_update(self, values_for_display, is_anomalous_flag, scapy_packet_idx):
+        """Performs the actual GUI update."""
         try:
-            sniff(iface=self.selected_interface, filter="ip", prn=self.packet_callback, stop_filter=lambda p: not self.sniffing)
-        except Exception as e:
-            print(f"Error during sniffing: {e}")
-
-    def packet_callback(self, packet):
-        """Callback function for each captured packet."""
-        self.packet_count += 1
-        self.all_packets_scapy.append(packet)
-        
-        timestamp_display = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(packet.time))}.{int(packet.time * 1000000) % 1000000}"
-        
-        ip_layer = packet.getlayer(IP)
-        if not ip_layer:
-            return
-
-        src_ip = ip_layer.src
-        dst_ip = ip_layer.dst
-        
-        src_port, dst_port, proto_name = 0, 0, "IP" # Default to 0 for non-TCP/UDP
-
-        if TCP in packet:
-            proto_name = "TCP"
-            src_port = packet[TCP].sport
-            dst_port = packet[TCP].dport
-        elif UDP in packet:
-            proto_name = "UDP"
-            src_port = packet[UDP].sport
-            dst_port = packet[UDP].dport
-        elif ICMP in packet:
-            proto_name = "ICMP"
-
-        values_for_display = (self.packet_count, timestamp_display, src_ip, src_port, dst_ip, dst_port, proto_name, len(packet))
-        
-        # Store a separate tuple for ML export with Unix timestamp
-        values_for_ml = (int(packet.time), src_ip, src_port, dst_ip, dst_port, proto_name, len(packet))
-        self.all_packets_data.append(values_for_ml)
-        
-        try:
-            tree_id = str(self.packet_count)
-            self.tree.insert("", "end", iid=tree_id, values=values_for_display)
+            # Update packet display count and insert into main treeview
+            self.packet_count_display += 1
+            # Adjust the first element of values_for_display for the GUI's local count
+            display_values_with_local_no = (self.packet_count_display,) + values_for_display[1:]
+            
+            self.tree.insert("", "end", iid=str(scapy_packet_idx + 1), values=display_values_with_local_no)
             self.tree.yview_moveto(1.0)
             
-            if self.is_anomalous(packet):
-                self.anomaly_count += 1
-                anomaly_values = (self.anomaly_count,) + values_for_display[1:]
-                self.anomaly_tree.insert("", "end", values=anomaly_values)
+            if is_anomalous_flag:
+                self.anomaly_count_display += 1
+                anomaly_values_with_local_no = (self.anomaly_count_display,) + values_for_display[1:]
+                self.anomaly_tree.insert("", "end", values=anomaly_values_with_local_no)
                 self.anomaly_tree.yview_moveto(1.0)
+                
         except tk.TclError:
+            # This can happen if the window is closed while packets are still being processed
             pass
 
-    def is_anomalous(self, packet):
-        # Placeholder for your anomaly detection logic
-        if TCP in packet and (packet[TCP].dport == 8080 or packet[TCP].sport == 8080):
-            return True
-        return False
-        
     def on_packet_select(self, event):
+        """
+        Displays detailed header information for the selected packet.
+        Retrieves the full Scapy packet from the manager's stored list using the iid.
+        """
         selected_item_id = self.tree.focus()
         if selected_item_id:
             try:
-                item_index = int(selected_item_id) - 1
-                if 0 <= item_index < len(self.all_packets_scapy):
-                    packet = self.all_packets_scapy[item_index]
+                # The iid is the index (packet_count - 1) from the PacketCaptureManager's all_packets_scapy list
+                manager_packet_index = int(selected_item_id) - 1
+                
+                # Access the stored packets from the packet_capture_manager
+                if 0 <= manager_packet_index < len(self.packet_capture_manager.all_packets_scapy):
+                    packet = self.packet_capture_manager.all_packets_scapy[manager_packet_index]
                     header_info = packet.show(dump=True)
                     self.header_text.config(state='normal')
                     self.header_text.delete(1.0, tk.END)
                     self.header_text.insert(tk.END, header_info)
                     self.header_text.config(state='disabled')
             except (ValueError, IndexError):
-                pass # Ignore if the selection is somehow invalid
+                pass # Ignore if the selection is somehow invalid or out of sync
 
     def update_system_info(self):
+        """Updates CPU and RAM usage in the GUI."""
         if self.winfo_exists():
-            if self.sniffing:
+            # Only update if sniffing is active to avoid unnecessary psutil calls
+            if self.packet_capture_manager.sniffing:
                 self.cpu_label.config(text=f"{psutil.cpu_percent()}%")
                 self.ram_label.config(text=f"{psutil.virtual_memory().percent}%")
             self.after(1000, self.update_system_info)
             
-    def _ip_to_int(self, ip_str):
-        """Converts an IP address string to its integer representation."""
-        try:
-            return int(ipaddress.ip_address(ip_str))
-        except ValueError:
-            return 0 # Return 0 or None for invalid IPs
-
-    def export_data_for_ml(self):
-        """Exports the captured packet data to a CSV file with IPs as integers."""
-        if not self.all_packets_data:
-            messagebox.showinfo("No Data", "There is no data to export.")
-            return
-        
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            title="Save Captured Traffic for ML"
-        )
-        
-        if not file_path:
-            return
-
-        header = ["Timestamp", "Source_IP", "Source_Port", "Destination_IP", "Destination_Port", "Protocol", "Length"]
-        
-        processed_data = []
-        for row in self.all_packets_data:
-            # Original ML row format: (UnixTime, SrcIP_str, SrcPort, DstIP_str, DstPort, Proto_str, Length)
-            unix_time, src_ip_str, src_port, dst_ip_str, dst_port, proto_str, length = row
-            
-            src_ip_int = self._ip_to_int(src_ip_str)
-            dest_ip_int = self._ip_to_int(dst_ip_str)
-            
-            proto_map = {"TCP": 6, "UDP": 17, "ICMP": 1, "IP": 0} 
-            proto_int = proto_map.get(proto_str, -1)
-
-            processed_data.append([unix_time, src_ip_int, src_port, dest_ip_int, dst_port, proto_int, length])
-
-        try:
-            with open(file_path, 'w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(header)
-                writer.writerows(processed_data)
-            messagebox.showinfo("Export Successful", f"Data successfully exported to:\n{file_path}")
-        except Exception as e:
-            messagebox.showerror("Export Error", f"An error occurred while exporting the data: {e}")
-
-
     def exit_page(self):
-        self.sniffing = False 
+        """Stops capturing and returns to the home page."""
+        self.packet_capture_manager.stop_capture()
         self.controller.show_frame("HomePage")
 
     def stop_and_report(self):
-        self.sniffing = False
-        print("Generating report... (Not implemented)")
+        """Stops capturing and triggers a report generation (placeholder)."""
+        self.packet_capture_manager.stop_capture()
+        messagebox.showinfo("Report", "Packet capture stopped. Report generation is not yet implemented.")
+
 
 # Main part for testing remains the same
 if __name__ == "__main__":
@@ -335,7 +264,9 @@ if __name__ == "__main__":
             container.grid_columnconfigure(0, weight=1)
 
             self.frames = {}
-            from pages.home import HomePage
+            # Ensure these imports use absolute paths from your project root (e.g., 'src')
+            from pages.home import HomePage 
+            
             for F in (HomePage, MonitorPage):
                 frame = F(container, self)
                 self.frames[F.__name__] = frame
@@ -343,8 +274,12 @@ if __name__ == "__main__":
             
             self.show_frame("HomePage")
             try:
+                # Attempt to set a default interface for testing purposes if available
+                # This part is for standalone testing, normally selected from HomePage
                 if psutil.net_if_addrs():
                     first_interface = list(psutil.net_if_addrs().keys())[0]
+                    # To test MonitorPage directly, you'd typically set the interface after creation
+                    # e.g., self.frames["MonitorPage"].set_interface(first_interface)
             except Exception as e:
                 print(f"Could not set a default interface for testing: {e}")
 
