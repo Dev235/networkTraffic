@@ -9,7 +9,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from scapy.all import IP, TCP, UDP, wrpcap
 import csv
 from utils.flow_feature_extractor import FlowFeatureExtractor
-
+from decimal import Decimal
 
 class ReportPage(tk.Frame):
     def __init__(self, parent, controller):
@@ -68,10 +68,11 @@ class ReportPage(tk.Frame):
         self.total_packets_label = ttk.Label(stats_frame, text="0")
         self.total_packets_label.grid(row=0, column=1, sticky='w', padx=5, pady=3)
 
-        ttk.Label(stats_frame, text="Anomalous Flows Detected:").grid(row=1, column=0, sticky='w', padx=5, pady=3)
+        ttk.Label(stats_frame, text="Total Anomalies Detected:").grid(row=1, column=0, sticky='w', padx=5, pady=3)
         self.total_anomalies_label = ttk.Label(stats_frame, text="0")
         self.total_anomalies_label.grid(row=1, column=1, sticky='w', padx=5, pady=3)
         
+        # MODIFICATION: Changed the title of the graph frame
         graph_frame = ttk.LabelFrame(self.summary_tab, text="Protocol Distribution")
         graph_frame.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
         graph_frame.grid_rowconfigure(0, weight=1)
@@ -79,7 +80,8 @@ class ReportPage(tk.Frame):
         
         self.fig = Figure(figsize=(5, 4), dpi=100, facecolor="#3e3e3e")
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Protocols", color='white')
+        # MODIFICATION: Changed the title of the graph itself
+        self.ax.set_title("Protocol Breakdown", color='white')
         self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
@@ -93,7 +95,7 @@ class ReportPage(tk.Frame):
         packets_frame.grid_rowconfigure(0, weight=1)
         packets_frame.grid_columnconfigure(0, weight=1)
         
-        self.packets_tree = ttk.Treeview(packets_frame, columns=("No", "Time", "SrcIP", "DstIP", "Proto", "Length", "Status"), show="headings")
+        self.packets_tree = ttk.Treeview(packets_frame, columns=("No", "Time", "SrcIP", "DstIP", "Proto", "Length", "Status", "Reason"), show="headings")
         self.packets_tree.grid(row=0, column=0, sticky="nsew")
         self.setup_packets_treeview(self.packets_tree)
         
@@ -136,10 +138,12 @@ class ReportPage(tk.Frame):
         
         self.total_packets_label.config(text=str(len(all_packets)))
         self.total_anomalies_label.config(text=str(len(anomalous_flows)))
+        # MODIFICATION: Call the protocol chart populator
         self.populate_protocol_chart(all_packets)
         self.populate_all_packets_table(all_packets, anomalous_flows)
         self.populate_frequent_flows_table(flow_counts)
 
+    # MODIFICATION: This function now populates the protocol pie chart
     def populate_protocol_chart(self, all_packets):
         self.ax.clear()
         if not all_packets:
@@ -152,21 +156,46 @@ class ReportPage(tk.Frame):
         
         self.ax.pie(proto_counts, labels=proto_counts.index, autopct='%1.1f%%', startangle=90, textprops={'color':"w"})
         self.ax.axis('equal')
+        self.ax.set_title("Protocol Breakdown", color='white')
         self.fig.tight_layout()
         self.canvas.draw()
 
     def populate_all_packets_table(self, all_packets, anomalous_flows):
         self.packets_tree.delete(*self.packets_tree.get_children())
-        anomalous_flow_keys = {flow.get('Flow_Key', '') for flow in anomalous_flows}
         
+        anomaly_reasons = {}
+        for anomaly in anomalous_flows:
+            if anomaly.get('Detection_Method') == 'Rule-Based':
+                idx = anomaly.get('packet_index')
+                if idx is not None:
+                    anomaly_reasons[idx] = anomaly.get('Predicted_Label', 'Rule Violation')
+            elif anomaly.get('Detection_Method') == 'Machine Learning':
+                flow_key = anomaly.get('Flow_Key')
+                if flow_key:
+                    # Store the reason for all packets in that flow
+                    anomaly_reasons[flow_key] = anomaly.get('Predicted_Label', 'ML Detection')
+
         for i, packet in enumerate(all_packets):
             if IP not in packet: continue
             
             flow_key, _ = self.get_flow_key_from_packet(packet)
-            status = "Anomalous" if flow_key in anomalous_flow_keys else "Normal"
             
-            timestamp = pd.to_datetime(packet.time, unit='s').strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            values = (i + 1, timestamp, packet[IP].src, packet[IP].dst, packet.lastlayer().name, len(packet), status)
+            status = "Normal"
+            reason = ""
+            if i in anomaly_reasons:
+                status = "Anomalous"
+                reason = anomaly_reasons[i]
+            elif flow_key in anomaly_reasons:
+                status = "Anomalous"
+                reason = anomaly_reasons[flow_key]
+
+            try:
+                timestamp = float(packet.time)
+                ts_str = pd.to_datetime(timestamp, unit='s').strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            except (ValueError, TypeError):
+                ts_str = str(packet.time)
+
+            values = (i + 1, ts_str, packet[IP].src, packet[IP].dst, packet.lastlayer().name, len(packet), status, reason)
             tag = ('anomalous',) if status == "Anomalous" else ()
             self.packets_tree.insert("", "end", iid=str(i), values=values, tags=tag)
             
@@ -193,17 +222,13 @@ class ReportPage(tk.Frame):
         self.header_text.config(state='disabled')
         
     def setup_packets_treeview(self, tree):
-        columns = ("No", "Time", "SrcIP", "DstIP", "Proto", "Length", "Status")
+        columns = ("No", "Time", "SrcIP", "DstIP", "Proto", "Length", "Status", "Reason")
         tree["columns"] = columns
-        tree.heading("No", text="No.")
-        tree.heading("Time", text="Time")
-        tree.heading("SrcIP", text="Source IP")
-        tree.heading("DstIP", text="Dest IP")
-        tree.heading("Proto", text="Protocol")
-        tree.heading("Length", text="Length")
-        tree.heading("Status", text="Status")
-        
-        for col, width in [("No", 50), ("Time", 160), ("SrcIP", 120), ("DstIP", 120), ("Proto", 80), ("Length", 70), ("Status", 90)]:
+        for col, heading, width in [("No", "No.", 40), ("Time", "Time", 160), ("SrcIP", "Source IP", 110), 
+                                     ("DstIP", "Dest IP", 110), ("Proto", "Protocol", 70), 
+                                     ("Length", "Length", 60), ("Status", "Status", 90),
+                                     ("Reason", "Anomaly Reason", 200)]:
+            tree.heading(col, text=heading)
             tree.column(col, width=width, anchor='w')
 
     @staticmethod
@@ -211,8 +236,7 @@ class ReportPage(tk.Frame):
         if IP not in packet: return None, None
         
         ip_src, ip_dst = packet[IP].src, packet[IP].dst
-        protocol, src_port, dst_port = None, 0, 0
-        is_forward = True
+        protocol, src_port, dst_port = "IP", 0, 0
 
         if TCP in packet:
             protocol, src_port, dst_port = 'TCP', packet[TCP].sport, packet[TCP].dport
@@ -226,9 +250,8 @@ class ReportPage(tk.Frame):
             flow_key = f"{ip_src}:{src_port} -> {ip_dst}:{dst_port} ({protocol})"
         else:
             flow_key = f"{ip_dst}:{dst_port} -> {ip_src}:{src_port} ({protocol})"
-            is_forward = False
             
-        return flow_key, is_forward
+        return flow_key, (ip_src, src_port) < (ip_dst, dst_port)
 
     def go_home(self):
         self.controller.show_frame("HomePage")
@@ -244,7 +267,16 @@ class ReportPage(tk.Frame):
                 with open(txt_path, 'w') as f:
                     f.write("Network Capture Report\n" + "="*30 + "\n\n")
                     f.write(f"Total Packets Captured: {len(self.report_data['all_packets'])}\n")
-                    f.write(f"Anomalous Flows Detected: {len(self.report_data['anomalous_flows'])}\n\n")
+                    f.write(f"Total Anomalies Detected: {len(self.report_data['anomalous_flows'])}\n\n")
+                    
+                    df = pd.DataFrame(self.report_data['anomalous_flows'])
+                    if not df.empty:
+                        f.write("--- Anomaly Breakdown by Method ---\n")
+                        f.write(df['Detection_Method'].value_counts().to_string())
+                        f.write("\n\n--- Anomaly Breakdown by Type ---\n")
+                        f.write(df['Predicted_Label'].value_counts().to_string())
+                        f.write("\n\n")
+
                     f.write("--- Frequent Flows ---\n")
                     sorted_flows = sorted(self.report_data['flow_counts'].items(), key=lambda item: item[1], reverse=True)
                     for flow_key, count in sorted_flows[:20]:
@@ -271,7 +303,7 @@ class ReportPage(tk.Frame):
         if not csv_path: return
             
         try:
-            fieldnames = ['Flow_Key', 'Predicted_Label', 'Anomaly_Score'] + FlowFeatureExtractor.CICIDS_FEATURES_ORDER
+            fieldnames = ['Flow_Key', 'Predicted_Label', 'Anomaly_Score', 'Detection_Method'] + FlowFeatureExtractor.CICIDS_FEATURES_ORDER
             
             with open(csv_path, 'w', newline='') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
