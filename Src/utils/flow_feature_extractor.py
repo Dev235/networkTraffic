@@ -229,6 +229,7 @@ class FlowFeatureExtractor:
         completed_flows_list = [] # Collect completed flows as dictionaries
         flows_to_delete = []
 
+        # It's safer to iterate on a copy of keys, as items might be deleted during iteration
         for flow_key, flow_data in list(self.flow_stats.items()):
             if (current_time - flow_data['start_time'] > self.time_window) or \
                (flow_data['last_packet_time'] and (current_time - flow_data['last_packet_time'] > self.time_window)):
@@ -251,9 +252,8 @@ class FlowFeatureExtractor:
             del self.flow_stats[key]
         
         if not completed_flows_list:
-            return pd.DataFrame()
+            return pd.DataFrame() # Return empty DataFrame if no flows completed
 
-        # Create a DataFrame from the list of dictionaries
         completed_flows_df = pd.DataFrame(completed_flows_list)
         
         # Reorder columns to match the model's expected input, filling missing with 0
@@ -445,8 +445,8 @@ class FlowFeatureExtractor:
             'Idle Std': idle_std * 1_000_000,
             'Idle Max': idle_max * 1_000_000,
             'Idle Min': idle_min * 1_000_000,
-            'URG Flag Count': urg_flag_count,
-            'ECE Flag Count': ece_flag_count,
+            'URG Flag Count': urg_flag_count, # Added back from the 52 features list
+            'ECE Flag Count': ece_flag_count, # Added back from the 52 features list
             'Flow Start Time': flow['start_time'], # Raw Unix timestamp (seconds)
             'Flow End Time': flow['end_time'],     # Raw Unix timestamp (seconds)
         }
@@ -510,7 +510,6 @@ class FlowFeatureExtractor:
         if not completed_flows_list:
             return pd.DataFrame()
 
-        # Create a DataFrame from the list of dictionaries
         completed_flows_df = pd.DataFrame(completed_flows_list)
         
         # Reorder columns to match the model's expected input, filling missing with 0
