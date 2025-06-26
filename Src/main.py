@@ -6,6 +6,7 @@ import psutil
 
 from pages.home import HomePage
 from pages.monitor import MonitorPage
+from pages.report import ReportPage # Import the new page
 
 class MainApp(tk.Tk):
     def __init__(self):
@@ -19,11 +20,11 @@ class MainApp(tk.Tk):
         container.grid_columnconfigure(0, weight=1)
 
         self.frames = {}
-        for F in (HomePage, MonitorPage):
+        for F in (HomePage, MonitorPage, ReportPage): # Add ReportPage here
             frame = F(container, self)
             self.frames[F.__name__] = frame
             frame.grid(row=0, column=0, sticky="nsew")
-        
+
         self.show_frame("HomePage")
 
     def show_frame(self, page_name):

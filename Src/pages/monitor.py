@@ -6,62 +6,46 @@ import threading
 import time
 import psutil
 import sv_ttk
-import csv # For potential direct CSV writing from GUI if needed
-from scapy.all import sniff, IP, TCP, UDP # Keep for basic packet display
+import csv
+from scapy.all import sniff, IP, TCP, UDP
 
-# Import the new modular components
 from utils.packet_capture_manager import PacketCaptureManager
 from utils.anomaly_detector import AnomalyDetector
-import os # For pathing in export
+import os
 
-# --- Constants for model and scaler paths ---
 MODELS_ROOT_DIR = os.path.join(os.path.dirname(__file__), '../ml_models')
 
 class MonitorPage(tk.Frame):
-    """
-    A GUI page for monitoring network traffic on a selected interface.
-    This page allows for pausing, resuming, and exporting packet capture.
-    """
+    # ... (init and other functions remain the same) ...
     def __init__(self, parent, controller):
-        """
-        Initializes the MonitorPage.
-
-        Args:
-            parent: The parent widget.
-            controller: The main application controller.
-        """
         super().__init__(parent)
         self.controller = controller
         self.selected_interface = None
-        self.packet_count_display = 0 # Counter for display
-        self.anomaly_count_display = 0 # Counter for display
+        self.packet_count_display = 0
+        self.anomaly_count_display = 0
+        self.capture_start_time = None
 
-        # Initialize the anomaly detector and packet capture manager
-        # AnomalyDetector now requires the root directory of models
         self.anomaly_detector = AnomalyDetector(model_dir=MODELS_ROOT_DIR)
         self.packet_capture_manager = PacketCaptureManager(
             update_gui_callback=self._update_traffic_display,
             anomaly_detector=self.anomaly_detector
         )
 
-        # Set the theme and background
         sv_ttk.set_theme("dark")
         self.configure(background="#2e2e2e")
 
-        # Main frame with a title
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
         
         title_label = ttk.Label(self, text="Network Traffic Analysis", font=("Helvetica", 16, "bold"))
         title_label.grid(row=0, column=0, pady=10, padx=10, sticky="w")
 
-        # Main container frame
         main_container = ttk.Frame(self)
         main_container.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
-        main_container.grid_rowconfigure(0, weight=4) # Packet Table
-        main_container.grid_rowconfigure(1, weight=2) # System/Header Info
-        main_container.grid_rowconfigure(2, weight=3) # Anomalous Packets
-        main_container.grid_rowconfigure(3, weight=1) # Buttons
+        main_container.grid_rowconfigure(0, weight=4)
+        main_container.grid_rowconfigure(1, weight=2)
+        main_container.grid_rowconfigure(2, weight=3)
+        main_container.grid_rowconfigure(3, weight=1)
         main_container.grid_columnconfigure(0, weight=1)
         main_container.grid_columnconfigure(1, weight=1)
 
@@ -113,7 +97,6 @@ class MonitorPage(tk.Frame):
         anomaly_frame.grid_rowconfigure(0, weight=1)
         anomaly_frame.grid_columnconfigure(0, weight=1)
 
-        # Columns for anomalous flows: ID, Start Time, Dest Port, Flow Duration, Predicted Label, Anomaly Score
         self.anomaly_tree = ttk.Treeview(anomaly_frame, columns=("No", "Time", "DestPort", "FlowDuration", "Predicted", "Score"), show="headings")
         self.anomaly_tree.grid(row=0, column=0, sticky="nsew")
         self.setup_anomaly_treeview(self.anomaly_tree)
@@ -141,7 +124,6 @@ class MonitorPage(tk.Frame):
         self.update_system_info()
 
     def setup_treeview(self, tree):
-        """Helper function to set up the columns for the main packet treeview."""
         columns = ("No", "Time", "SrcIP", "SrcPort", "DstIP", "DstPort", "Proto", "Length")
         tree["columns"] = columns
         
@@ -164,7 +146,6 @@ class MonitorPage(tk.Frame):
         tree.column("Length", width=80, anchor='center')
 
     def setup_anomaly_treeview(self, tree):
-        """Helper function to set up the columns for the anomalous flows treeview."""
         columns = ("No", "Time", "DestPort", "FlowDuration", "Predicted", "Score")
         tree["columns"] = columns
         
@@ -182,23 +163,24 @@ class MonitorPage(tk.Frame):
         tree.column("Predicted", width=120, anchor='w')
         tree.column("Score", width=100, anchor='center')
 
-
     def set_interface(self, interface_name):
-        """Sets the interface for packet capture and initiates a fresh session."""
         self.selected_interface = interface_name
         self._clear_all_displays()
         self.packet_capture_manager.set_interface(interface_name)
+        self.capture_start_time = time.time()
 
     def toggle_capture(self):
-        """Toggles the packet capturing state (start/stop/resume)."""
+        if not self.packet_capture_manager.sniffing and not self.capture_start_time:
+             self.capture_start_time = time.time()
+             
         new_button_text = self.packet_capture_manager.toggle_capture()
         self.toggle_capture_button.config(text=new_button_text)
-        # When starting a new capture or resuming, clear displays
+
         if new_button_text == "Stop Capturing" and self.packet_capture_manager.packet_count == 0:
             self._clear_all_displays()
+            self.capture_start_time = time.time()
     
     def _clear_all_displays(self):
-        """Clears all Treeview displays and resets counters."""
         self.tree.delete(*self.tree.get_children())
         self.anomaly_tree.delete(*self.anomaly_tree.get_children())
         self.header_text.config(state='normal')
@@ -206,50 +188,41 @@ class MonitorPage(tk.Frame):
         self.header_text.config(state='disabled')
         self.packet_count_display = 0
         self.anomaly_count_display = 0
+        self.capture_start_time = None
 
-    def _update_traffic_display(self, values_for_display, is_anomalous, scapy_packet_idx, flow_details=None, flow_processed=False):
-        """
-        Callback method to update the Treeviews in the GUI from the packet capture manager.
-        This runs in the main Tkinter thread safely using after().
-        """
-        # Ensure updates are queued safely to the main thread
-        self.after(0, lambda: self._perform_gui_update(values_for_display, is_anomalous, scapy_packet_idx, flow_details, flow_processed))
+    def _update_traffic_display(self, values_for_display, is_anomalous, scapy_packet_idx, flow_details=None, flow_processed=False, error_message=None):
+        self.after(0, self._perform_gui_update, values_for_display, is_anomalous, scapy_packet_idx, flow_details, flow_processed, error_message)
 
-    def _perform_gui_update(self, values_for_display, is_anomalous, scapy_packet_idx, flow_details, flow_processed):
-        """Performs the actual GUI update."""
+    def _perform_gui_update(self, values_for_display, is_anomalous, scapy_packet_idx, flow_details, flow_processed, error_message):
+        if error_message:
+            messagebox.showerror("Capture Error", error_message)
+            self.exit_page()
+            return
+            
         try:
-            if not flow_processed: # This is a raw packet
+            if not flow_processed:
                 self.packet_count_display += 1
                 display_values_with_local_no = (self.packet_count_display,) + values_for_display[1:]
                 self.tree.insert("", "end", iid=str(scapy_packet_idx), values=display_values_with_local_no)
                 self.tree.yview_moveto(1.0)
             
-            if is_anomalous and flow_details: # This is an anomalous flow summary
+            if is_anomalous and flow_details:
                 self.anomaly_count_display += 1
                 anomaly_display_values = (
-                    self.anomaly_count_display,
-                    flow_details[1],  # Start Time
-                    flow_details[2],  # Dest Port
-                    f"{flow_details[3]:.0f}",  # Flow Duration (formatted)
-                    flow_details[4],  # Predicted Label
-                    flow_details[5]   # Anomaly Score
+                    self.anomaly_count_display, flow_details[1], flow_details[2],
+                    f"{float(flow_details[3]):.0f}", flow_details[4], flow_details[5]
                 )
                 self.anomaly_tree.insert("", "end", values=anomaly_display_values)
                 self.anomaly_tree.yview_moveto(1.0)
                 
         except tk.TclError:
-            pass # Window might be closing
+            pass
 
     def on_packet_select(self, event):
-        """
-        Displays detailed header information for the selected packet.
-        Retrieves the full Scapy packet from the manager's stored list using the iid.
-        """
         selected_item_id = self.tree.focus()
         if selected_item_id:
             try:
                 scapy_packet_idx = int(selected_item_id)
-                
                 if 0 <= scapy_packet_idx < len(self.packet_capture_manager.all_captured_scapy_packets):
                     packet = self.packet_capture_manager.all_captured_scapy_packets[scapy_packet_idx]
                     header_info = packet.show(dump=True)
@@ -261,7 +234,6 @@ class MonitorPage(tk.Frame):
                 pass
 
     def update_system_info(self):
-        """Updates CPU and RAM usage in the GUI."""
         if self.winfo_exists():
             if self.packet_capture_manager.sniffing:
                 self.cpu_label.config(text=f"{psutil.cpu_percent()}%")
@@ -269,17 +241,34 @@ class MonitorPage(tk.Frame):
             self.after(1000, self.update_system_info)
             
     def export_captured_data(self):
-        """Exports captured packets to PCAP and anomalous flows to CSV."""
-        self.packet_capture_manager.export_data()
-        messagebox.showinfo("Export Complete", "Captured data has been exported to PCAP and CSV files in the application directory.")
+        pcap_path = filedialog.asksaveasfilename(defaultextension=".pcap", filetypes=[("PCAP files", "*.pcap")], title="Save All Packets as PCAP")
+        if not pcap_path: return
 
+        csv_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")], title="Save All Flow Features as CSV")
+        if not csv_path: return
+            
+        self.packet_capture_manager.export_data(pcap_filename=pcap_path, csv_filename=csv_path)
 
     def exit_page(self):
-        """Stops capturing and returns to the home page."""
         self.packet_capture_manager.stop_capture()
+        self.toggle_capture_button.config(text="Resume Capturing")
         self.controller.show_frame("HomePage")
 
     def stop_and_report(self):
-        """Stops capturing and triggers a report generation (placeholder)."""
-        self.packet_capture_manager.stop_capture()
-        messagebox.showinfo("Report", "Packet capture stopped. Report generation is not yet implemented.")
+        if self.packet_capture_manager.sniffing:
+            self.packet_capture_manager.stop_capture()
+            self.toggle_capture_button.config(text="Resume Capturing")
+
+        all_packets = self.packet_capture_manager.all_captured_scapy_packets
+        anomalous_flows = self.packet_capture_manager.anomalous_flows_data
+        flow_counts = self.packet_capture_manager.flow_extractor.flow_counts
+        all_completed_flows = self.packet_capture_manager.all_completed_flows # NEW: Get all flows
+
+        if not all_packets:
+            messagebox.showinfo("No Data", "No packets were captured in this session.")
+            return
+
+        report_page = self.controller.frames["ReportPage"]
+        # NEW: Pass all_completed_flows to the report page
+        report_page.set_report_data(all_packets, anomalous_flows, flow_counts, all_completed_flows)
+        self.controller.show_frame("ReportPage")

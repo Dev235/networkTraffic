@@ -62,16 +62,27 @@ class AnomalyDetector:
             return pd.Series(), pd.Series(), pd.Series()
 
         try:
+            # --- FIX: Prepare data for the model ---
+            # Create a copy to avoid modifying the original DataFrame passed to this function
+            features_for_model = flow_features_df.copy()
+            
+            # Drop the 'Flow_Key' column if it exists, as the model was not trained on it.
+            if 'Flow_Key' in features_for_model.columns:
+                features_for_model = features_for_model.drop(columns=['Flow_Key'])
+            # --- END FIX ---
+
+
             # --- DEBUGGING: Print features received by detector ---
-            print("AnomalyDetector: Features received for detection:")
-            print(flow_features_df.columns.tolist())
-            print(f"Shape of received features: {flow_features_df.shape}\n")
+            # print("AnomalyDetector: Features being sent to model:")
+            # print(features_for_model.columns.tolist())
+            # print(f"Shape of features for model: {features_for_model.shape}\n")
             # --- END DEBUGGING ---
 
             # Scale the features. This outputs a NumPy array.
             scaled_features = pd.DataFrame(
-                self.scaler.transform(flow_features_df),
-                columns=flow_features_df.columns
+                self.scaler.transform(features_for_model),
+                columns=features_for_model.columns,
+                index=flow_features_df.index # Keep original index
             )
 
             
@@ -85,8 +96,8 @@ class AnomalyDetector:
             class_labels = np.array(self.model.classes_)
             
             # --- DEBUGGING: Print model classes and probabilities shape ---
-            print(f"Model classes: {class_labels}")
-            print(f"Probabilities shape: {probabilities.shape}\n")
+            # print(f"Model classes: {class_labels}")
+            # print(f"Probabilities shape: {probabilities.shape}\n")
             # --- END DEBUGGING ---
 
             anomaly_scores = pd.Series(np.zeros(len(predictions)), index=flow_features_df.index)

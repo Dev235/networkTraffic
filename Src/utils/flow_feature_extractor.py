@@ -57,6 +57,7 @@ class FlowFeatureExtractor:
         self.cleanup_interval = cleanup_interval # How often to clean up old flows
         self.last_cleanup_time = time.time()
         self.packet_metadata = {} # To store IP, port, protocol for PCAP and CSV
+        self.flow_counts = defaultdict(int) # NEW: To count frequent flows
 
     def _get_flow_key(self, packet):
         """Generates a bidirectional flow key (src:port-dst:port-proto)"""
@@ -75,13 +76,15 @@ class FlowFeatureExtractor:
             src_port = packet[UDP].sport
             dst_port = packet[UDP].dport
         else:
-            return None # Only TCP/UDP flows for feature extraction
+            # For non-TCP/UDP, use a simpler key for counting
+            return f"{ip_src} -> {ip_dst} ({packet.lastlayer().name})"
+
 
         # Create canonical flow key (smaller IP:port first)
         if (ip_src, src_port) < (ip_dst, dst_port):
-            return f"{ip_src}:{src_port}-{ip_dst}:{dst_port}-{protocol}"
+            return f"{ip_src}:{src_port} -> {ip_dst}:{dst_port} ({protocol})"
         else:
-            return f"{ip_dst}:{dst_port}-{ip_src}:{src_port}-{protocol}"
+            return f"{ip_dst}:{dst_port} -> {ip_src}:{src_port} ({protocol})"
             
     def process_packet(self, packet):
         """
@@ -93,6 +96,7 @@ class FlowFeatureExtractor:
             return pd.DataFrame() # No valid flow key for this packet, return empty DataFrame
 
         current_time = time.time()
+        self.flow_counts[flow_key] += 1 # NEW: Increment count for this flow
         
         # Store metadata for later CSV export
         packet_info = self._extract_packet_metadata(packet)
@@ -102,6 +106,10 @@ class FlowFeatureExtractor:
         # Check for expired flows before processing the current packet
         completed_flows = self._cleanup_flows(current_time) # This now returns a DataFrame
         
+        # Only proceed with feature extraction for TCP/UDP
+        if "TCP" not in flow_key and "UDP" not in flow_key:
+            return completed_flows
+
         flow = self.flow_stats[flow_key]
 
         # Determine packet direction relative to the canonical flow key
@@ -236,14 +244,22 @@ class FlowFeatureExtractor:
                 
                 features = self._calculate_flow_features(flow_data)
                 
+                # NEW: Add the flow key to the features dict
+                features['Flow_Key'] = flow_key
+
                 # Add back destination port based on flow_key for the feature dataframe
-                parts = flow_key.split('-')
+                parts = flow_key.split(' -> ')
                 if len(parts) >= 2:
-                    dst_part = parts[1].split(':')
-                    if len(dst_part) == 2:
-                        features['Destination Port'] = int(dst_part[1])
+                    # Example key: "192.168.1.1:1234 -> 192.168.1.2:80 (TCP)"
+                    dst_part_str = parts[1].split(' ')[0]
+                    dst_ip_port = dst_part_str.split(':')
+                    if len(dst_ip_port) == 2:
+                         features['Destination Port'] = int(dst_ip_port[1])
+                    else: # No port, just IP
+                         features['Destination Port'] = 0
                 else:
                     features['Destination Port'] = 0
+
 
                 completed_flows_list.append(features)
                 flows_to_delete.append(flow_key)
@@ -256,17 +272,23 @@ class FlowFeatureExtractor:
 
         completed_flows_df = pd.DataFrame(completed_flows_list)
         
+        # Store Flow_Key before reindexing
+        flow_keys = completed_flows_df['Flow_Key']
+        
         # Reorder columns to match the model's expected input, filling missing with 0
         reordered_features_df = completed_flows_df.reindex(columns=self.CICIDS_FEATURES_ORDER, fill_value=0)
         
+        # Add the Flow_Key back
+        reordered_features_df['Flow_Key'] = flow_keys
+
         # Ensure "Destination Port" is an integer type as expected by the model
         if 'Destination Port' in reordered_features_df.columns:
             reordered_features_df['Destination Port'] = reordered_features_df['Destination Port'].astype(int)
 
         # --- DEBUGGING: Print features being returned from extractor ---
-        print("\nFlowFeatureExtractor: Features being outputted in real-time:")
-        print(reordered_features_df.columns.tolist())
-        print(f"Shape of real-time features from extractor: {reordered_features_df.shape}\n")
+        # print("\nFlowFeatureExtractor: Features being outputted in real-time:")
+        # print(reordered_features_df.columns.tolist())
+        # print(f"Shape of real-time features from extractor: {reordered_features_df.shape}\n")
         # --- END DEBUGGING ---
 
         return reordered_features_df
@@ -280,11 +302,12 @@ class FlowFeatureExtractor:
 
     def _calculate_flow_features(self, flow):
         """
+
         Calculates all CICIDS2017-like features for a single completed flow.
         """
         # --- Basic Features ---
         flow_duration = flow['end_time'] - flow['start_time']
-        if flow_duration <= 0: flow_duration = 1 # Avoid division by zero
+        if flow_duration <= 0: flow_duration = 1e-6 # Avoid division by zero, use small number
 
         total_fwd_packets = flow['fwd_packets']
         total_bwd_packets = flow['bwd_packets']
@@ -483,46 +506,4 @@ class FlowFeatureExtractor:
         if current_time is None:
             current_time = time.time()
             
-        completed_flows_list = [] # Collect completed flows as dictionaries
-        flows_to_delete = []
-
-        for flow_key, flow_data in list(self.flow_stats.items()):
-            if (current_time - flow_data['start_time'] > self.time_window) or \
-               (flow_data['last_packet_time'] and (current_time - flow_data['last_packet_time'] > self.time_window)):
-                
-                features = self._calculate_flow_features(flow_data)
-                
-                # Add back destination port based on flow_key for the feature dataframe
-                parts = flow_key.split('-')
-                if len(parts) >= 2:
-                    dst_part = parts[1].split(':')
-                    if len(dst_part) == 2:
-                        features['Destination Port'] = int(dst_part[1])
-                else:
-                    features['Destination Port'] = 0
-
-                completed_flows_list.append(features)
-                flows_to_delete.append(flow_key)
-            
-        for key in flows_to_delete:
-            del self.flow_stats[key]
-        
-        if not completed_flows_list:
-            return pd.DataFrame()
-
-        completed_flows_df = pd.DataFrame(completed_flows_list)
-        
-        # Reorder columns to match the model's expected input, filling missing with 0
-        reordered_features_df = completed_flows_df.reindex(columns=self.CICIDS_FEATURES_ORDER, fill_value=0)
-        
-        # Ensure "Destination Port" is an integer type as expected by the model
-        if 'Destination Port' in reordered_features_df.columns:
-            reordered_features_df['Destination Port'] = reordered_features_df['Destination Port'].astype(int)
-
-        # --- DEBUGGING: Print features being returned from extractor ---
-        print("\nFlowFeatureExtractor: Features being outputted in real-time:")
-        print(reordered_features_df.columns.tolist())
-        print(f"Shape of real-time features from extractor: {reordered_features_df.shape}\n")
-        # --- END DEBUGGING ---
-
-        return reordered_features_df
+        return self._cleanup_flows(current_time)
