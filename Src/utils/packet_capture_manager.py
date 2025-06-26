@@ -2,20 +2,18 @@
 
 import threading
 import time
-from scapy.all import sniff, IP, TCP, UDP, ICMP, wrpcap
+from scapy.all import sniff, IP, TCP, UDP, ICMP, wrpcap, rdpcap
 from utils.anomaly_detector import AnomalyDetector
 from utils.flow_feature_extractor import FlowFeatureExtractor
+from utils.rule_based_detector import RuleBasedDetector
 import pandas as pd
 import os
 import csv
 import re
 from tkinter import messagebox
+from decimal import Decimal
 
 class PacketCaptureManager:
-    """
-    Manages the packet capturing process, including sniffing, basic parsing,
-    and interaction with the anomaly detection module.
-    """
     def __init__(self, update_gui_callback, anomaly_detector: AnomalyDetector):
         self.selected_interface = None
         self.sniffing = False
@@ -24,10 +22,11 @@ class PacketCaptureManager:
         self.sniff_thread = None
         self.update_gui_callback = update_gui_callback
         self.anomaly_detector = anomaly_detector
+        self.rule_detector = RuleBasedDetector()
         self.all_captured_scapy_packets = []
         self.flow_extractor = FlowFeatureExtractor()
         self.anomalous_flows_data = []
-        self.all_completed_flows = [] # NEW: To store all processed flows
+        self.all_completed_flows = []
 
     def set_interface(self, interface_name):
         self.selected_interface = interface_name
@@ -43,24 +42,31 @@ class PacketCaptureManager:
         if not self.sniffing:
             self.sniffing = True
             if fresh_start:
-                self.packet_count = 0
-                self.anomaly_count = 0
-                self.all_captured_scapy_packets.clear()
-                self.flow_extractor = FlowFeatureExtractor()
-                self.anomalous_flows_data.clear()
-                self.all_completed_flows.clear() # NEW: Clear on fresh start
+                self._reset_state()
             self._start_sniffing_thread()
             return True
         return False
+        
+    def _reset_state(self):
+        self.packet_count = 0
+        self.anomaly_count = 0
+        self.all_captured_scapy_packets.clear()
+        self.flow_extractor = FlowFeatureExtractor()
+        self.anomalous_flows_data.clear()
+        self.all_completed_flows.clear()
+        self.rule_detector = RuleBasedDetector()
 
     def stop_capture(self):
         if self.sniffing:
             self.sniffing = False
-            remaining_flows = self.flow_extractor.get_completed_flow_features(current_time=time.time() + self.flow_extractor.time_window + 1)
-            if not remaining_flows.empty:
-                self._process_detected_flows(remaining_flows)
+            self._finalize_flow_processing()
             return True
         return False
+        
+    def _finalize_flow_processing(self):
+        remaining_flows = self.flow_extractor.get_completed_flow_features(current_time=time.time() + self.flow_extractor.time_window + 1)
+        if not remaining_flows.empty:
+            self._process_detected_flows(remaining_flows)
 
     def toggle_capture(self):
         if self.sniffing:
@@ -75,105 +81,142 @@ class PacketCaptureManager:
             print("No interface selected for sniffing.")
             self.sniffing = False
             return
-
         try:
-            sniff(iface=self.selected_interface, filter="ip", prn=self._packet_callback, stop_filter=lambda p: not self.sniffing, store=0)
+            sniff(iface=self.selected_interface, filter="ip", prn=self._packet_callback_live, stop_filter=lambda p: not self.sniffing, store=0)
         except Exception as e:
             print(f"Error during sniffing on {self.selected_interface}: {e}")
-            self.update_gui_callback(None, False, -1, None, False, error_message=f"Sniffing failed: {e}. Check Npcap/WinPcap installation and permissions.")
+            if self.update_gui_callback:
+                self.update_gui_callback(None, False, -1, None, False, error_message=f"Sniffing failed: {e}.")
         finally:
             self.sniffing = False
 
-    def _packet_callback(self, packet):
-        if not self.sniffing:
-            return
-
-        self.all_captured_scapy_packets.append(packet)
-        completed_flows_df = self.flow_extractor.process_packet(packet)
-        
+    def _packet_callback_live(self, packet):
         self.packet_count += 1
-        timestamp_display = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(packet.time))}.{int(packet.time * 1000000) % 1000000}"
-        
-        ip_layer = packet.getlayer(IP)
-        src_ip = ip_layer.src if ip_layer else "N/A"
-        dst_ip = ip_layer.dst if ip_layer else "N/A"
-        
-        src_port, dst_port, proto_name = 0, 0, "IP"
-        if TCP in packet:
-            proto_name, src_port, dst_port = "TCP", packet[TCP].sport, packet[TCP].dport
-        elif UDP in packet:
-            proto_name, src_port, dst_port = "UDP", packet[UDP].sport, packet[UDP].dport
-        elif ICMP in packet:
-            proto_name = "ICMP"
+        packet_index = len(self.all_captured_scapy_packets)
+        self._common_packet_processing(packet, packet_index)
 
-        values_for_display = (self.packet_count, timestamp_display, src_ip, src_port, dst_ip, dst_port, proto_name, len(packet))
-        self.update_gui_callback(values_for_display, False, len(self.all_captured_scapy_packets) - 1, flow_details=None, flow_processed=False)
+        if self.update_gui_callback:
+            timestamp_display = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(packet.time))}.{int(packet.time * 1000000) % 1000000}"
+            ip_layer = packet.getlayer(IP)
+            src_ip, dst_ip = (ip_layer.src, ip_layer.dst) if ip_layer else ("N/A", "N/A")
+            proto_name, src_port, dst_port = self._get_proto_and_ports(packet)
+            values_for_display = (self.packet_count, timestamp_display, src_ip, src_port, dst_ip, dst_port, proto_name, len(packet))
+            self.update_gui_callback(values_for_display, False, packet_index, None, False)
+            
+    def _common_packet_processing(self, packet, packet_index):
+        self.all_captured_scapy_packets.append(packet)
+        flow_key = self.flow_extractor._get_flow_key(packet)
 
+        rule_alerts = self.rule_detector.check_rules(packet, flow_key)
+        if rule_alerts:
+            for alert in rule_alerts:
+                self.anomaly_count += 1
+                # MODIFICATION: Add packet_index to the record
+                rule_anomaly_data = self._create_anomaly_record(flow_key, alert, 1.0, 'Rule-Based', packet, packet_index)
+                self.anomalous_flows_data.append(rule_anomaly_data)
+                if self.update_gui_callback:
+                    self._update_gui_with_anomaly(rule_anomaly_data)
+
+        completed_flows_df = self.flow_extractor.process_packet(packet)
         if not completed_flows_df.empty:
             self._process_detected_flows(completed_flows_df)
 
     def _process_detected_flows(self, flows_df: pd.DataFrame):
         predictions, scores, is_anomaly_series = self.anomaly_detector.detect_anomaly(flows_df)
-
-        if predictions.empty:
-            return
+        if predictions.empty: return
 
         for idx, row_series in flows_df.iterrows():
             flow_key = flows_df.loc[idx, 'Flow_Key']
             print(f"[{flow_key}] -> Label: {predictions.get(idx, 'UNKNOWN')} | Anomaly: {is_anomaly_series.get(idx, False)} | Score: {scores.get(idx, 0):.4f}")
             
-            # --- MODIFICATION: Store all flows with their predictions ---
-            flow_data_with_prediction = row_series.to_dict()
-            flow_data_with_prediction['Predicted_Label'] = predictions.get(idx, 'UNKNOWN')
-            flow_data_with_prediction['Anomaly_Score'] = scores.get(idx, 0.0)
-            self.all_completed_flows.append(flow_data_with_prediction)
-            # --- END MODIFICATION ---
+            flow_data = self._create_anomaly_record_from_flow(row_series, predictions.get(idx), scores.get(idx))
+            self.all_completed_flows.append(flow_data)
 
             if is_anomaly_series.get(idx, False):
                 self.anomaly_count += 1
-                self.anomalous_flows_data.append(flow_data_with_prediction)
+                self.anomalous_flows_data.append(flow_data)
+                if self.update_gui_callback:
+                    self._update_gui_with_anomaly(flow_data)
 
-                flow_start_time_display = pd.to_datetime(flow_data_with_prediction.get('Flow Start Time', 0), unit='s').strftime('%Y-%m-%d %H:%M:%S')
-                flow_summary_values = (
-                    self.anomaly_count,
-                    flow_start_time_display,
-                    flow_data_with_prediction.get('Destination Port', 'N/A'),
-                    f"{flow_data_with_prediction.get('Flow Duration', 0):.0f}",
-                    flow_data_with_prediction.get('Predicted_Label', 'UNKNOWN'),
-                    f"{flow_data_with_prediction.get('Anomaly_Score', 0):.4f}"
-                )
-                self.update_gui_callback(None, True, -1, flow_summary_values, True)
+    def process_pcap_file(self, filepath, progress_callback):
+        try:
+            self._reset_state()
+            packets = rdpcap(filepath)
+            total_packets = len(packets)
+            
+            progress_callback(0, "Analyzing packets...")
+            
+            for i, packet in enumerate(packets):
+                # Pass the index 'i' to the processing function
+                self._common_packet_processing(packet, i)
+                
+                if (i + 1) % 50 == 0:
+                    progress = int(((i + 1) / total_packets) * 100)
+                    progress_callback(progress, f"Processed {i+1}/{total_packets} packets...")
+            
+            self._finalize_flow_processing()
+            progress_callback(100, "Analysis complete.")
+            return True
+        except Exception as e:
+            print(f"Error processing PCAP file: {e}")
+            return False
 
+    def _get_proto_and_ports(self, packet):
+        if TCP in packet: return "TCP", packet[TCP].sport, packet[TCP].dport
+        if UDP in packet: return "UDP", packet[UDP].sport, packet[UDP].dport
+        if ICMP in packet: return "ICMP", 0, 0
+        return "IP", 0, 0
+
+    def _create_anomaly_record(self, flow_key, reason, score, method, packet=None, packet_index=None):
+        return {
+            'Flow_Key': flow_key,
+            'Predicted_Label': reason,
+            'Anomaly_Score': score,
+            'Detection_Method': method,
+            'Flow Start Time': float(packet.time) if packet else time.time(),
+            'Destination Port': packet.dport if TCP in packet or UDP in packet else 'N/A',
+            'Flow Duration': 0,
+            'packet_index': packet_index # Store the index of the triggering packet
+        }
+
+    def _create_anomaly_record_from_flow(self, flow_series, prediction, score):
+        record = flow_series.to_dict()
+        record['Predicted_Label'] = prediction
+        record['Anomaly_Score'] = score
+        record['Detection_Method'] = 'Machine Learning'
+        return record
+
+    def _update_gui_with_anomaly(self, anomaly_data):
+        if self.update_gui_callback:
+            flow_start_time_display = pd.to_datetime(anomaly_data.get('Flow Start Time', 0), unit='s').strftime('%Y-%m-%d %H:%M:%S')
+            flow_summary_values = (
+                self.anomaly_count,
+                flow_start_time_display,
+                anomaly_data.get('Destination Port', 'N/A'),
+                f"{anomaly_data.get('Flow Duration', 0):.0f}",
+                anomaly_data.get('Predicted_Label', 'UNKNOWN'),
+                f"{anomaly_data.get('Anomaly_Score', 0):.4f}",
+                anomaly_data.get('Detection_Method', 'N/A')
+            )
+            self.update_gui_callback(None, True, -1, flow_summary_values, True)
+    
     def export_data(self, pcap_filename, csv_filename):
-        """
-        Exports all captured packets to a PCAP file and ALL processed flow features to a CSV.
-        """
+        # ... (This function remains unchanged) ...
         if not self.all_captured_scapy_packets and not self.all_completed_flows:
             messagebox.showinfo("Export Status", "No data to export.")
             return
 
-        # --- MODIFICATION: Export ALL completed flows to CSV ---
         if self.all_completed_flows:
             try:
-                # Define fieldnames, including the ones we added
-                fieldnames = ['Flow_Key', 'Predicted_Label', 'Anomaly_Score'] + FlowFeatureExtractor.CICIDS_FEATURES_ORDER
-                
-                # Filter out any potential missing columns from the dicts
-                export_data = []
-                for row in self.all_completed_flows:
-                    filtered_row = {key: row.get(key) for key in fieldnames}
-                    export_data.append(filtered_row)
-
+                fieldnames = ['Flow_Key', 'Predicted_Label', 'Anomaly_Score', 'Detection_Method'] + FlowFeatureExtractor.CICIDS_FEATURES_ORDER
                 with open(csv_filename, 'w', newline='') as csvfile:
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
                     writer.writeheader()
-                    writer.writerows(export_data)
-                
+                    writer.writerows(self.all_completed_flows)
                 print(f"All flow features exported to {csv_filename}")
             except Exception as e:
                 messagebox.showerror("Export Error", f"An error occurred while exporting CSV: {e}")
                 return
-        # --- END MODIFICATION ---
         
         if self.all_captured_scapy_packets:
             try:
